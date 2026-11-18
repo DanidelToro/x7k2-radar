@@ -174,6 +174,7 @@
   .sub-label { margin: 12px 0 8px; font-size: 12.5px; font-weight: 600; }
   .sub-label span { font-weight: 400; color: var(--muted); }
   .chip .chip-hint { font-size: 11px; color: var(--muted); }
+  .mis-casas-note { margin: 8px 0 0; }
   .extra-limit { margin-top: 14px; }
 
   /* ---------- Escaneo ---------- */
@@ -475,6 +476,14 @@
         <div class="chips" id="extra-markets"></div>
         <h3 class="sub-label">Casas de apuestas por región <span>· más regiones = consenso más fiable</span></h3>
         <div class="chips" id="regions"></div>
+        <h3 class="sub-label">Mis casas <span>· solo ellas pueden dar la mejor cuota · sin ninguna marcada valen todas</span></h3>
+        <div class="league-tools">
+          <button type="button" class="btn btn-sm" id="casas-all">Todas</button>
+          <button type="button" class="btn btn-sm" id="casas-none">Ninguna</button>
+        </div>
+        <div class="chips" id="mis-casas"></div>
+        <p class="empty-search" id="mis-casas-empty">Escanea una vez para ver aquí las casas disponibles.</p>
+        <p class="note mis-casas-note">Pinnacle y los exchanges se siguen usando para calcular la cuota justa aunque no estén marcados.</p>
         <div class="field extra-limit">
           <label for="f-max-extra">Partidos máx. con mercados extra</label>
           <input type="number" id="f-max-extra" min="0" step="5" value="20">
@@ -605,18 +614,24 @@ const EXTRA_MARKETS = [
 const REGION_OPTIONS = [
   ['eu', 'Europa', true],
   ['uk', 'Reino Unido'],
-  ['us', 'EE. UU.', true],
+  ['us', 'EE. UU.'],
   ['au', 'Australia'],
 ];
 const KELLY_FRACTION = 0.25; // Kelly fraccionado (1/4): mucho menos agresivo que el completo
 const STORAGE_KEY    = "oddsradar.keys";
 const LOG_KEY        = "oddsradar.log";
 const AUTOCLOSE_KEY  = "oddsradar.autoclose";
+const MISCASAS_KEY   = "oddsradar.miscasas";
 const CLOSE_WINDOW_MIN = 5;  // el cierre automático se guarda en los últimos X minutos antes del partido
 
 // Casas "afiladas": mueven la cuota primero y aceptan apuestas grandes, así que su precio
 // sin margen es la mejor estimación de la probabilidad real
 const SHARP_BOOKS = new Set(['pinnacle']);
+
+// Casas en las que puedes apostar (claves de The Odds API, p. ej. 'bet365', 'williamhill').
+// Solo ellas pueden dar la mejor cuota de un pick; la cuota justa se sigue calculando con todas.
+// Vacía = sin restricción. Si eliges casas en "Mis casas", esa selección manda sobre esta lista
+const MIS_CASAS = [];
 
 // Exchanges y la comisión que cobran sobre la ganancia neta. Cámbiala si tu cuenta paga otra
 const EXCHANGES = {
@@ -642,7 +657,7 @@ const PRESETS = {
   // Muchos picks con valor pequeño, para revisarlos después con Claude.
   // `scan` (opcional) fija además los ajustes de escaneo; extras: 'all' marca todos los mercados extra
   volumen:     { label: 'Volumen',     desc: 'Muchos picks, poco valor', valor: 0.5, prob: 15, cuota: 1.30, casas: 4,
-                 scan: { regions: ['eu', 'uk', 'us'], extras: 'all', maxExtra: 40, hours: 24 } },
+                 scan: { regions: ['eu', 'uk'], extras: 'all', maxExtra: 40, hours: 24 } },
 };
 const PROMPT_MAX = 15;      // picks por prompt: con más, la revisión de Claude empeora
 const SCAN_STALE_MIN = 30;  // minutos desde el escaneo a partir de los cuales se avisa de que las cuotas son viejas
@@ -856,7 +871,8 @@ const state = {
   lastStats: null,
   scanned: false,
   picks: [],
-  discarded: { stale: 0, outlier: 0, noSharp: 0, suspect: 0 },
+  discarded: { stale: 0, outlier: 0, noSharp: 0, suspect: 0, notMine: 0 },
+  misCasas: null,     // casas elegidas en "Mis casas" (null = no hay selección guardada: se usa MIS_CASAS)
   log: [],            // registro de apuestas (se guarda en este navegador)
   sportFilter: 'all',
   marketFilter: 'all',
@@ -1187,6 +1203,47 @@ function getRegions() {
   return [...document.querySelectorAll('.region:checked')].map(cb => cb.value);
 }
 
+// ==========================================
+// MIS CASAS
+// ==========================================
+function loadMisCasas() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(MISCASAS_KEY) || 'null');
+    if (Array.isArray(saved)) state.misCasas = saved.filter(key => typeof key === 'string');
+  } catch (e) { /* almacenamiento no disponible: se usa MIS_CASAS */ }
+}
+
+function saveMisCasas(keys) {
+  state.misCasas = keys;
+  try {
+    localStorage.setItem(MISCASAS_KEY, JSON.stringify(keys));
+  } catch (e) { /* almacenamiento no disponible: la selección dura hasta cerrar la pestaña */ }
+}
+
+// Casas en las que puedes apostar: la selección guardada manda sobre MIS_CASAS. Vacía = todas
+const allowedBooks = () => state.misCasas ?? MIS_CASAS;
+
+// Una casilla por casa del último escaneo, más las de MIS_CASAS y las ya elegidas aunque no hayan aparecido
+function renderMisCasas() {
+  const allowed = new Set(allowedBooks());
+  const books = new Map();
+  state.selections.forEach(s => s.prices.forEach(p => books.set(p.bookKey, p.bookmaker)));
+  [...MIS_CASAS, ...allowed].forEach(key => { if (!books.has(key)) books.set(key, key); });
+
+  const container = $('#mis-casas');
+  container.innerHTML = '';
+  [...books]
+    .sort((a, b) => a[1].localeCompare(b[1], 'es'))
+    .forEach(([key, name]) => container.append(makeChip('mi-casa', key, name, allowed.has(key), name === key ? '' : key)));
+  $('#mis-casas-empty').hidden = books.size > 0;
+}
+
+function selectMisCasas(checked) {
+  document.querySelectorAll('.mi-casa').forEach(cb => { cb.checked = checked; });
+  saveMisCasas(checked ? [...document.querySelectorAll('.mi-casa')].map(cb => cb.value) : []);
+  refilter();
+}
+
 function getMaxExtraEvents() {
   return Math.max(0, Math.round(readNumber('f-max-extra', 20)));
 }
@@ -1272,6 +1329,7 @@ function getFilters() {
     DESV_MAX:  Math.max(0, readNumber('f-desv', 0.25)), // distancia a la mediana en log-odds; 0 = no comprobar
     VALOR_MAX: Math.max(0, readNumber('f-valormax', 15)), // %; por encima, el valor es sospechoso. 0 = sin límite
     SOLO_SHARP: $('#f-sharp').checked,
+    CASAS_OK:  allowedBooks(),                          // casas que pueden dar la mejor cuota; vacía = todas
   };
 }
 
@@ -1428,7 +1486,9 @@ function sharpReference(prices) {
 // Un pick es una selección en la que la mejor cuota (neta) supera a la cuota justa de referencia
 function findPicks(selections, filters, now) {
   const picks = [];
-  const discarded = { stale: 0, outlier: 0, noSharp: 0, suspect: 0 };
+  const discarded = { stale: 0, outlier: 0, noSharp: 0, suspect: 0, notMine: 0 };
+  // Casas en las que puedes apostar. Solo limitan la mejor cuota: todo lo demás usa todas las cuotas recibidas
+  const allowed = filters.CASAS_OK && filters.CASAS_OK.length ? new Set(filters.CASAS_OK) : null;
 
   for (const item of selections) {
     // 1) Casas: cuentan todas las cuotas recibidas, pero las clónicas (línea idéntica) valen por una
@@ -1448,14 +1508,18 @@ function findPicks(selections, filters, now) {
     const fresh = p => isFresh(p, now, filters.EDAD_MAX);
     const stale = new Set(item.prices.filter(p => (SHARP_BOOKS.has(p.bookKey) || p.exchange) && !fresh(p)));
 
-    // 4) Mejor cuota, ya descontada la comisión de los exchanges. Si es vieja, se prueba con la siguiente
+    // 4) Mejor cuota, ya descontada la comisión de los exchanges, solo de casas en las que puedes apostar
+    //    (Pinnacle y los exchanges también, si no están en tu lista). Si es vieja, se prueba con la siguiente
     let best = null;
-    for (const candidate of [...sane].sort((a, b) => b.net - a.net)) {
+    for (const candidate of sane.filter(p => !allowed || allowed.has(p.bookKey)).sort((a, b) => b.net - a.net)) {
       if (fresh(candidate)) { best = candidate; break; }
       stale.add(candidate);
     }
     discarded.stale += stale.size;
-    if (!best) continue;
+    if (!best) {
+      if (allowed) discarded.notMine++; // ninguna casa tuya tiene una cuota válida y reciente
+      continue;
+    }
 
     // 5) Cuota justa: casas afiladas con cuota reciente; si no hay, consenso (mediana de las demás casas)
     let ref = sharpReference(item.prices.filter(fresh));
@@ -1669,6 +1733,7 @@ async function runScanner() {
     state.regions = regions.join(',');
     state.lastStats = stats;
     state.scanned = true;
+    renderMisCasas();
     recomputePicks();
 
     const d = state.discarded;
@@ -1860,6 +1925,7 @@ function renderScanNote() {
   if (d.outlier) parts.push(`cuotas anómalas descartadas: ${d.outlier}`);
   if (d.noSharp) parts.push(`selecciones sin Pinnacle ni exchange: ${d.noSharp}`);
   if (d.suspect) parts.push(`valor sospechoso: ${d.suspect}`);
+  if (d.notMine) parts.push(`sin casa tuya: ${d.notMine}`);
   note.textContent = parts.join(' · ');
 }
 
@@ -2156,401 +2222,4 @@ async function importLog(file) {
     state.log.push(...added);
     saveLog();
     renderRegister();
-    showToast(`📥 ${added.length} apuestas importadas · ${entries.length - added.length} ya estaban`);
-  } catch (error) {
-    showToast('❌ El archivo no es una copia válida del registro');
-  }
-}
-
-// Con la pestaña abierta, guarda el cierre solo unos minutos antes de cada partido
-function checkAutoClosing() {
-  if (!$('#reg-auto').checked) return;
-  const now = Date.now();
-  const windowMs = CLOSE_WINDOW_MIN * 60000;
-  const due = state.log.filter(e => {
-    const left = e.startsAt - now;
-    return left > 0 && left <= windowMs && !(e.closeTried && e.closeTried >= e.startsAt - windowMs);
-  });
-  if (due.length) updateClosing(due, { silent: true });
-}
-
-function registerSummary(log) {
-  const settled = log.filter(e => e.result === 'win' || e.result === 'loss');
-  const wins = settled.filter(e => e.result === 'win').length;
-  const staked = settled.reduce((acc, e) => acc + e.stakeU, 0);
-  const profit = settled.reduce((acc, e) => acc + (e.result === 'win' ? e.stakeU * (e.cuota - 1) : -e.stakeU), 0);
-  const expected = settled.reduce((acc, e) => acc + e.prob, 0) / (settled.length || 1);
-  const clvs = log.map(clvOf).filter(v => v !== null);
-
-  return {
-    settled: settled.length,
-    hitRate: settled.length ? wins / settled.length * 100 : null,
-    expected,
-    profit,
-    yield: staked ? profit / staked * 100 : null,
-    clvCount: clvs.length,
-    clvMean: clvs.length ? clvs.reduce((a, b) => a + b, 0) / clvs.length : null,
-    clvBeat: clvs.length ? clvs.filter(v => v > 0).length / clvs.length * 100 : null,
-  };
-}
-
-// Probabilidad prevista frente a aciertos reales, por tramos de 10 puntos.
-// Si el método está bien calibrado, los puntos caen sobre la diagonal
-function renderCalibration(log) {
-  const settled = log.filter(e => e.result === 'win' || e.result === 'loss');
-  if (settled.length === 0) {
-    return `<p class="note chart-note">Marca el resultado de tus apuestas para ver aquí el gráfico de probabilidad prevista frente a aciertos reales.</p>`;
-  }
-
-  const bins = {};
-  for (const e of settled) {
-    const bin = Math.min(9, Math.floor(e.prob / 10));
-    const b = (bins[bin] ??= { n: 0, wins: 0, probSum: 0 });
-    b.n++;
-    b.probSum += e.prob;
-    if (e.result === 'win') b.wins++;
-  }
-
-  const W = 380, H = 270, L = 46, R = 14, T = 14, B = 44;
-  const x = pct => L + (W - L - R) * pct / 100;
-  const y = pct => H - B - (H - T - B) * pct / 100;
-  const ticks = [0, 25, 50, 75, 100];
-
-  const grid = ticks.map(t => `
-    <line class="grid" x1="${x(0)}" x2="${x(100)}" y1="${y(t)}" y2="${y(t)}"/>
-    <text class="tick" x="${x(0) - 8}" y="${y(t) + 4}" text-anchor="end">${t}%</text>
-    <text class="tick" x="${x(t)}" y="${y(0) + 16}" text-anchor="middle">${t}%</text>`).join('');
-
-  const dots = Object.entries(bins).map(([bin, b]) => {
-    const predicted = b.probSum / b.n;
-    const actual = b.wins / b.n * 100;
-    const radius = Math.min(11, 4 + Math.sqrt(b.n) * 1.5);
-    const tip = `Tramo ${bin * 10}–${bin * 10 + 10}% · ${b.n} apuesta${b.n > 1 ? 's' : ''} · previsto ${formatPct(predicted)} · real ${formatPct(actual)}`;
-    return `<circle class="dot" cx="${x(predicted).toFixed(1)}" cy="${y(actual).toFixed(1)}" r="${radius.toFixed(1)}" tabindex="0" data-tip="${escapeHtml(tip)}" aria-label="${escapeHtml(tip)}"/>`;
-  }).join('');
-
-  return `
-    <figure class="chart">
-      <figcaption>Probabilidad prevista frente a aciertos reales <span>· ${settled.length} apuestas con resultado · punto más grande = más apuestas</span></figcaption>
-      <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Gráfico de calibración: probabilidad prevista frente a aciertos reales">
-        ${grid}
-        <line class="ideal" x1="${x(0)}" y1="${y(0)}" x2="${x(100)}" y2="${y(100)}"/>
-        ${dots}
-        <text class="axis" x="${x(50)}" y="${H - 6}" text-anchor="middle">Probabilidad prevista</text>
-        <text class="axis" transform="translate(12 ${y(50)}) rotate(-90)" text-anchor="middle">Aciertos reales</text>
-      </svg>
-      <p class="note">La línea discontinua es la calibración perfecta. Por encima de la diagonal aciertas más de lo previsto; por debajo, menos. ${settled.length < 50 ? 'Con menos de unas 50 apuestas el gráfico es sobre todo ruido: no saques conclusiones todavía.' : ''}</p>
-    </figure>`;
-}
-
-function renderRegisterRow(e) {
-  const clv = clvOf(e);
-  const started = e.startsAt <= Date.now();
-  const closeCell = e.closeFair
-    ? `${formatOdd(e.closeFair)}<small>${escapeHtml(e.closeRef || '')}</small>`
-    : `<span class="muted">${started ? 'sin dato' : 'pendiente'}</span>`;
-  const options = [['', 'Pendiente'], ['win', '✅ Acertada'], ['loss', '❌ Fallada'], ['void', 'Nula']]
-    .map(([value, label]) => `<option value="${value}"${e.result === value ? ' selected' : ''}>${label}</option>`).join('');
-
-  return `
-    <tr>
-      <td><strong>${escapeHtml(e.match)}</strong><small>${escapeHtml(e.selection)} · ${formatWhen(e.startsAt)}</small></td>
-      <td>${escapeHtml(e.bookmaker)}</td>
-      <td class="num">${formatOdd(e.cuota)}</td>
-      <td class="num">${formatOdd(e.fairOdd)}</td>
-      <td class="num">${signedPct(e.value)}</td>
-      <td class="num">${formatUnits(e.stakeU)}</td>
-      <td class="num">${closeCell}</td>
-      <td class="num ${clv === null ? '' : clv > 0 ? 'pos' : 'neg'}">${clv === null ? '–' : signedPct(clv)}</td>
-      <td><select class="select" data-result="${escapeHtml(e.id)}" aria-label="Resultado">${options}</select></td>
-      <td><button type="button" class="btn btn-ghost btn-sm" data-del="${escapeHtml(e.id)}" title="Quitar del registro" aria-label="Quitar del registro">✕</button></td>
-    </tr>`;
-}
-
-function renderRegister() {
-  const log = [...state.log].sort((a, b) => b.startsAt - a.startsAt);
-  const body = $('#reg-body');
-  $('#reg-count').textContent = log.length ? `${log.length} apuesta${log.length > 1 ? 's' : ''}` : '';
-  $('#reg-actions').hidden = log.length === 0;
-  $('#reg-export').disabled = log.length === 0;
-
-  if (log.length === 0) {
-    body.innerHTML = `<p class="note">Aún no hay apuestas. Pulsa <strong>📒 Para registro</strong> en un pick: se guarda aquí y se copia una fila lista para pegar en tu hoja.</p>`;
-    return;
-  }
-
-  const games = countGames(pendingEntries());
-  $('#reg-close').disabled = games === 0;
-  $('#reg-close').textContent = games
-    ? `🔄 Guardar cuota de cierre (${games} partido${games > 1 ? 's' : ''})`
-    : '🔄 Sin partidos pendientes';
-
-  const s = registerSummary(log);
-  const tiles = [
-    ['Con resultado', `${s.settled} de ${log.length}`, ''],
-    ['Aciertos', s.hitRate === null ? '–' : formatPct(s.hitRate), s.hitRate === null ? '' : `previsto ${formatPct(s.expected)}`],
-    ['Beneficio', s.settled ? `${s.profit >= 0 ? '+' : ''}${formatUnits(s.profit)}` : '–', s.yield === null ? '' : `yield ${signedPct(s.yield)}`],
-    ['CLV medio', s.clvMean === null ? '–' : signedPct(s.clvMean), s.clvCount ? `${formatNum(s.clvBeat, 0)}% baten el cierre (${s.clvCount})` : 'sin cuotas de cierre'],
-  ].map(([label, value, sub]) => `<div class="reg-tile"><div class="stat-label">${label}</div><div class="reg-value">${value}</div><small>${sub}</small></div>`).join('');
-
-  body.innerHTML = `
-    <div class="reg-tiles">${tiles}</div>
-    <div class="table-wrap">
-      <table class="reg-table">
-        <thead><tr>
-          <th>Apuesta</th><th>Casa</th><th class="num">Cuota</th><th class="num">Justa</th><th class="num">Valor</th>
-          <th class="num">Stake</th><th class="num">Cierre</th><th class="num">CLV</th><th>Resultado</th><th></th>
-        </tr></thead>
-        <tbody>${log.map(renderRegisterRow).join('')}</tbody>
-      </table>
-    </div>
-    ${renderCalibration(log)}`;
-}
-
-// Tooltip del gráfico
-function showTip(target) {
-  const tip = $('#tip');
-  const rect = target.getBoundingClientRect();
-  tip.textContent = target.dataset.tip;
-  tip.hidden = false;
-  const left = Math.max(8, Math.min(window.innerWidth - tip.offsetWidth - 8, rect.left + rect.width / 2 - tip.offsetWidth / 2));
-  tip.style.left = `${left}px`;
-  tip.style.top = `${rect.top - tip.offsetHeight - 8}px`;
-}
-
-// ==========================================
-// PRUEBAS
-// Abre el archivo con #test al final de la URL y mira la consola (F12)
-// ==========================================
-function runSelfTests() {
-  const now = Date.now();
-  const stamp = new Date(now - 60000).toISOString();
-  // markets: [[mercado, [[resultado, cuota, línea opcional], …]], …]
-  const bookWith = (key, markets) => ({
-    key, title: key, last_update: stamp,
-    markets: markets.map(([marketKey, outcomes]) => ({
-      key: marketKey, last_update: stamp,
-      outcomes: outcomes.map(([name, price, point]) => (point === undefined ? { name, price } : { name, price, point })),
-    })),
-  });
-  const book = (key, marketKey, outcomes) => bookWith(key, [[marketKey, outcomes]]);
-  const game = (leagueKey, bookmakers) => ({
-    id: 'prueba', leagueKey, sport_title: 'Prueba', home_team: 'A', away_team: 'B',
-    commence_time: new Date(now + 3600000).toISOString(), bookmakers,
-  });
-  const filters = { VALOR_MIN: 2, VALOR_MAX: 0, PROB_MIN: 0, CUOTA_MIN: 1.01, CASAS_MIN: 1, EDAD_MAX: 30, DESV_MAX: 0.25, SOLO_SHARP: true };
-  const scan = (g, extra = {}) => findPicks(collectSelections(g), { ...filters, ...extra }, now);
-  const casas1x2 = () => [1, 2, 3, 4, 5].map(i => book(`casa${i}`, 'h2h', [['A', 1.85], ['Draw', 3.50], ['B', 4.40]]));
-
-  const results = [];
-  const check = (name, ok, detail = '') => {
-    results.push(Boolean(ok));
-    console.log(`${ok ? '✅' : '❌'} ${name}${detail ? ` (${detail})` : ''}`);
-  };
-
-  // 1. Con el 1X2 completo, las casas pagan menos que la justa de Pinnacle: no hay valor
-  let r = scan(game('soccer_epl', [book('pinnacle', 'h2h', [['A', 1.90], ['Draw', 3.55], ['B', 4.45]]), ...casas1x2()]));
-  check('1. Pinnacle 1X2 completo: 0 picks', r.picks.length === 0, `${r.picks.length} picks`);
-
-  // 2. Si Pinnacle no publica el empate, su línea se descarta: ni sirve de referencia ni crea valor falso
-  const sinEmpate = game('soccer_epl', [book('pinnacle', 'h2h', [['A', 1.90], ['B', 4.45]]), ...casas1x2()]);
-  r = scan(sinEmpate);
-  const consenso = scan(sinEmpate, { SOLO_SHARP: false });
-  const pinnacleUsada = collectSelections(sinEmpate).some(s => s.prices.some(p => p.bookKey === 'pinnacle'));
-  check('2. Pinnacle sin el empate: 0 picks', r.picks.length === 0 && consenso.picks.length === 0 && !pinnacleUsada,
-    `${r.picks.length} con referencia afilada, ${consenso.picks.length} con consenso`);
-
-  // 3. No favorito: 8.8 está lejos en cuota, pero cerca de la mediana en log-odds
-  const noFavorito = game('basketball_nba', [
-    book('pinnacle', 'h2h', [['A', 1.11], ['B', 7.6]]),
-    book('casa1', 'h2h', [['A', 1.10], ['B', 7.0]]), book('casa2', 'h2h', [['A', 1.09], ['B', 7.3]]),
-    book('casa3', 'h2h', [['A', 1.10], ['B', 7.5]]), book('casa4', 'h2h', [['A', 1.08], ['B', 7.6]]),
-    book('casa5', 'h2h', [['A', 1.07], ['B', 8.8]]),
-  ]);
-  r = scan(noFavorito, { VALOR_MIN: -100 });
-  const pickB = r.picks.find(p => p.selKey === 'h2h|B');
-  check('3. No favorito: el 8.8 no se descarta como anómalo', r.discarded.outlier === 0 && pickB && pickB.cuotaRaw === 8.8,
-    pickB ? `mejor cuota ${pickB.cuotaRaw}, valor ${signedPct(pickB.value)}` : 'sin pick');
-
-  // 4. El método de potencia da menos probabilidad al no favorito que el proporcional
-  const potencia = fairProbabilities([1.25, 4.60], 1, 'power');
-  const proporcional = fairProbabilities([1.25, 4.60], 1, 'proportional');
-  check('4. Método de potencia: no favorito más bajo y suma 1',
-    potencia[1] < proporcional[1] && Math.abs(potencia[0] + potencia[1] - 1) < 1e-6,
-    `${formatPct(potencia[1] * 100)} frente a ${formatPct(proporcional[1] * 100)}`);
-
-  // 5. 1ª parte en baloncesto: con empate y sin empate no se mezclan
-  const keys = collectSelections(game('basketball_nba', [
-    book('casa1', 'h2h_h1', [['A', 1.90], ['B', 1.90]]),
-    book('casa2', 'h2h_h1', [['A', 2.00], ['Draw', 15], ['B', 2.00]]),
-  ])).map(s => s.selKey).sort();
-  check('5. 1ª parte con y sin empate: keys distintas',
-    keys.join(',') === 'h2h_h1_3w|A,h2h_h1_3w|B,h2h_h1_3w|Draw,h2h_h1|A,h2h_h1|B', keys.join(', '));
-
-  // 6. Tres casas con la línea idéntica son una sola opinión
-  const clones = collectSelections(game('basketball_nba', ['a', 'b', 'c'].map(k => book(k, 'h2h', [['A', 1.80], ['B', 2.05]]))));
-  const casasA = clones.find(s => s.selKey === 'h2h|A').prices;
-  check('6. Tres casas clónicas cuentan como 1', casasA.length === 3 && countDistinctBooks(casasA) === 1,
-    `${casasA.length} casas, ${countDistinctBooks(casasA)} distintas`);
-
-  // 7. Pinnacle con un margen imposible (línea de 2 resultados incompleta o errónea) no sirve de referencia
-  r = scan(game('basketball_nba', [
-    book('pinnacle', 'h2h', [['A', 1.90], ['B', 4.45]]),
-    book('casa1', 'h2h', [['A', 1.45], ['B', 2.75]]), book('casa2', 'h2h', [['A', 1.44], ['B', 2.80]]),
-  ]));
-  check('7. Pinnacle con margen imposible: no es referencia', r.picks.length === 0 && r.discarded.noSharp === 2,
-    `${r.picks.length} picks, ${r.discarded.noSharp} selecciones sin referencia`);
-
-  // 8. Favorito: 1.60 frente a 1.47–1.50 es valor legítimo, no un error
-  r = scan(game('basketball_nba', [
-    book('pinnacle', 'h2h', [['A', 1.50], ['B', 2.70]]),
-    book('casa1', 'h2h', [['A', 1.48], ['B', 2.65]]), book('casa2', 'h2h', [['A', 1.49], ['B', 2.62]]),
-    book('casa3', 'h2h', [['A', 1.50], ['B', 2.60]]), book('casa4', 'h2h', [['A', 1.47], ['B', 2.68]]),
-    book('casa5', 'h2h', [['A', 1.60], ['B', 2.40]]),
-  ]), { VALOR_MIN: -100 });
-  const pickA = r.picks.find(p => p.selKey === 'h2h|A');
-  check('8. Favorito: el 1.60 no se descarta como anómalo', r.discarded.outlier === 0 && pickA && pickA.cuotaRaw === 1.60,
-    pickA ? `mejor cuota ${pickA.cuotaRaw}, valor ${signedPct(pickA.value)}` : 'sin pick');
-
-  // 9. No favorito: 11.5 frente a 7.8–8.2 sí es un error de cuota
-  r = scan(game('basketball_nba', [
-    book('pinnacle', 'h2h', [['A', 1.10], ['B', 7.9]]),
-    book('casa1', 'h2h', [['A', 1.09], ['B', 7.8]]), book('casa2', 'h2h', [['A', 1.09], ['B', 8.0]]),
-    book('casa3', 'h2h', [['A', 1.08], ['B', 8.0]]), book('casa4', 'h2h', [['A', 1.08], ['B', 8.2]]),
-    book('casa5', 'h2h', [['A', 1.05], ['B', 11.5]]),
-  ]), { VALOR_MIN: -100 });
-  const pickB9 = r.picks.find(p => p.selKey === 'h2h|B');
-  check('9. No favorito: el 11.5 se descarta como anómalo', r.discarded.outlier === 1 && pickB9 && pickB9.cuotaRaw === 8.2,
-    `${r.discarded.outlier} anómalas, mejor cuota ${pickB9 ? pickB9.cuotaRaw : 'ninguna'}`);
-
-  // 10. Compartir la cuota estándar del total no convierte a las casas en clónicas; coincidir en todo, sí
-  const total = [['Over', 1.91, 220.5], ['Under', 1.91, 220.5]];
-  const independientes = collectSelections(game('basketball_nba', [1, 2, 3, 4, 5, 6, 7, 8].map(i =>
-    bookWith(`casa${i}`, [['totals', total], ['h2h', [['A', 1.80 + i / 100], ['B', 2.05 - i / 100]]]]))));
-  const identicas = collectSelections(game('basketball_nba', ['a', 'b', 'c'].map(k =>
-    bookWith(k, [['totals', total], ['h2h', [['A', 1.80], ['B', 2.05]]]]))));
-  const over = selections => selections.find(s => s.selKey === 'totals|Más de 220.5').prices;
-  check('10. Firma del partido: 8 casas con el mismo total son 8; 3 idénticas en todo son 1',
-    countDistinctBooks(over(independientes)) === 8 && countDistinctBooks(over(identicas)) === 1,
-    `${countDistinctBooks(over(independientes))} y ${countDistinctBooks(over(identicas))} distintas`);
-
-  // 11. Preset Volumen: muchos picks con poco valor
-  const v = PRESETS.volumen;
-  check('11. Preset Volumen: valor 0.5, prob 15, cuota 1.30, casas 4',
-    v && v.valor === 0.5 && v.prob === 15 && v.cuota === 1.30 && v.casas === 4,
-    v ? `valor ${v.valor}, prob ${v.prob}, cuota ${v.cuota}, casas ${v.casas}` : 'no existe');
-
-  // 12. El prompt para Claude tiene el veredicto ESPERAR con sus tres datos
-  const prompt = pickA ? buildClaudePrompt([pickA]) : '';
-  check('12. Prompt: ESPERAR con qué, fuente y cuándo se resuelve',
-    prompt.includes('Veredicto: MANTENER, ESPERAR o DESCARTAR')
-    && /\(1\) qué está pendiente, \(2\) la fuente, \(3\) cuándo se espera que se resuelva/.test(prompt)
-    && prompt.includes('vuelve a escanear cuando se resuelva y, si el valor sigue, apuesta')
-    && prompt.includes('Pendiente (solo si ESPERAR): qué, fuente y cuándo se resuelve'));
-
-  // 13. Tandas para Claude: 42 picks de 15 en 15, y vuelta al principio
-  const tandas = [];
-  for (let i = 0, index = 0; i < 4; i++) {
-    const batch = promptBatch(42, index, 15);
-    tandas.push(`${batch.from}–${batch.to}`);
-    index = batch.next;
-  }
-  check('13. Tandas de 42 picks: 1–15, 16–30, 31–42 y vuelta a 1–15',
-    tandas.join(', ') === '1–15, 16–30, 31–42, 1–15' && promptBatch(9, 0, 15).to === 9, tandas.join(', '));
-
-  const passed = results.filter(Boolean).length;
-  console.log(`${passed === results.length ? '✅' : '❌'} Pruebas: ${passed}/${results.length} correctas`);
-  return passed === results.length;
-}
-
-// ==========================================
-// INICIO
-// ==========================================
-renderMarketOptions();
-renderLeaguePicker();
-renderPresets();
-renderSportFilter();
-renderResults();
-loadKeys();
-loadLog();
-renderRegister();
-updateScanButton();
-
-$('#league-search').addEventListener('input', applyLeagueSearch);
-document.querySelectorAll('[data-select]').forEach(btn => btn.addEventListener('click', () => selectLeagues(btn.dataset.select)));
-$('#btn-run').addEventListener('click', runScanner);
-$('#key-status').addEventListener('click', openSettings);
-$('#settings-cancel').addEventListener('click', () => $('#settings').close());
-$('#settings-form').addEventListener('submit', () => {
-  saveKeys();
-  const n = state.apiKeys.length;
-  showToast(n ? `${n} API key${n > 1 ? 's' : ''} guardada${n > 1 ? 's' : ''}` : 'API keys borradas');
-});
-
-// Filtros que no son de preset: se aplican al momento sobre el último escaneo
-$('#f-sharp').addEventListener('change', refilter);
-['f-edad', 'f-desv', 'f-valormax', 'f-banco', 'f-stakemin'].forEach(id => document.getElementById(id).addEventListener('input', refilter));
-$('#f-horas').addEventListener('input', updateScanButton);
-
-$('#market-filter').addEventListener('change', e => { state.marketFilter = e.target.value; state.promptBatch = 0; renderResults(); });
-$('#sort').addEventListener('change', e => { state.sort = e.target.value; state.promptBatch = 0; renderResults(); });
-$('#btn-copy-all').addEventListener('click', async () => {
-  const mains = visibleGroups().map(g => g.main);
-  const batch = promptBatch(mains.length, state.promptBatch);
-  await copyPicks(mains.slice(batch.from - 1, batch.to), mains.length > PROMPT_MAX ? `${batch.from}–${batch.to} de ${mains.length}` : '');
-  state.promptBatch = batch.next;
-  updateCopyButton(mains.length);
-});
-$('#btn-log-all').addEventListener('click', () => registerPicks(visibleGroups().map(g => g.main)));
-$('#results').addEventListener('click', e => {
-  const copy = e.target.closest('[data-copy]');
-  if (copy) copyPicks(state.picks.filter(p => p.id === Number(copy.dataset.copy)));
-  const log = e.target.closest('[data-log]');
-  if (log) registerPicks(state.picks.filter(p => p.id === Number(log.dataset.log)));
-});
-
-// Registro
-$('#reg-close').addEventListener('click', () => updateClosing(pendingEntries()));
-$('#reg-auto').addEventListener('change', () => { saveLog(); checkAutoClosing(); });
-$('#reg-copy').addEventListener('click', async () => {
-  const rows = [...state.log].sort((a, b) => a.startsAt - b.startsAt).map(sheetRow);
-  const ok = await copyToClipboard([SHEET_HEADER.join('\t'), ...rows].join('\n'));
-  showToast(ok ? `📋 Registro copiado (${rows.length} filas con cabecera). Pégalo en tu hoja` : '❌ No se pudo copiar el registro');
-});
-$('#reg-export').addEventListener('click', exportLog);
-$('#reg-import').addEventListener('click', () => $('#reg-import-file').click());
-$('#reg-import-file').addEventListener('change', async e => {
-  if (e.target.files[0]) await importLog(e.target.files[0]);
-  e.target.value = ''; // permite volver a elegir el mismo archivo
-});
-$('#reg-clear').addEventListener('click', () => {
-  if (!confirm(`¿Borrar las ${state.log.length} apuestas del registro? No se puede deshacer.`)) return;
-  state.log = [];
-  saveLog();
-  renderRegister();
-});
-$('#reg-body').addEventListener('change', e => {
-  const select = e.target.closest('[data-result]');
-  if (!select) return;
-  const entry = state.log.find(x => x.id === select.dataset.result);
-  if (entry) { entry.result = select.value; saveLog(); renderRegister(); }
-});
-$('#reg-body').addEventListener('click', e => {
-  const btn = e.target.closest('[data-del]');
-  if (!btn) return;
-  state.log = state.log.filter(x => x.id !== btn.dataset.del);
-  saveLog();
-  renderRegister();
-});
-['mouseover', 'focusin'].forEach(type => $('#reg-body').addEventListener(type, e => {
-  if (e.target.matches?.('[data-tip]')) showTip(e.target);
-}));
-['mouseout', 'focusout'].forEach(type => $('#reg-body').addEventListener(type, e => {
-  if (e.target.matches?.('[data-tip]')) $('#tip').hidden = true;
-}));
-setInterval(checkAutoClosing, 30000);
-setInterval(renderScanNote, 60000); // mantiene al día "cuotas leídas hace X min"
-if (location.href.endsWith('#test')) runSelfTests();
-</script>
-</body>
-</html>
+    showToast(`📥 
